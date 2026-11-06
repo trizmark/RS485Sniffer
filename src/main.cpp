@@ -24,22 +24,20 @@ AsyncWebServer server(80);
 WiFiClient espClient;
 DNSServer dns;
 
-// Inter-MODBUS message gap in millis
-#define INTERMESSAGE_GAP  5
+// Modbus RTU framing configuration.
+constexpr uint32_t MODBUS_BAUD_RATE = 9600;
+constexpr uint32_t MODBUS_CHARACTER_BITS = 10; // 8N1: start + 8 data + stop
+constexpr uint32_t MODBUS_T3_5_MICROS =
+    (3500000UL * MODBUS_CHARACTER_BITS + MODBUS_BAUD_RATE - 1) /
+    MODBUS_BAUD_RATE;
 
-#define MESSAGE_GAP_TIMEOUT_IN_MICROS   500
+// Increase this value if the maximum frame size changes.
+constexpr size_t MAX_MODBUS_FRAME_SIZE = 64;
+constexpr uint16_t UDP_DESTINATION_PORT = 8888;
 
-unsigned int localPort = 8888;
-char RecvBuffer[256];
-
-unsigned int recvIndex = 0;
-unsigned long msgIndex = 0;
-unsigned long receiveTime = 0;
-
-char receiveTimeString[32];
-char msgIndexString[32];
-
-bool dumpData = false;
+uint8_t candidateBuffer[MAX_MODBUS_FRAME_SIZE];
+size_t candidateLength = 0;
+uint32_t lastByteMicros = 0;
 
 IPAddress remote_ip(192, 168, 0, 201);
 
@@ -48,9 +46,6 @@ IPAddress remote_ip(192, 168, 0, 201);
 
 EspSoftwareSerial::UART myPort;
 
-int received;
-unsigned long lastModbusEvent;
-bool fReadData = false;
 
 
 /*
@@ -132,9 +127,7 @@ void setup() {
   // init the serial port
   Serial.begin(115200);
 
-  myPort.begin(9600, SWSERIAL_8N1, RX_PIN, TX_PIN, false);
-
-  lastModbusEvent = millis();
+  myPort.begin(MODBUS_BAUD_RATE, SWSERIAL_8N1, RX_PIN, TX_PIN, false);
 }
 
 
@@ -143,71 +136,176 @@ void p(int X) {
   Serial.print(X, HEX);
 }
 
+bool isSupportedFunction(uint8_t functionCode) {
+  const uint8_t baseFunction = functionCode & 0x7F;
+  return baseFunction == 0x03 || baseFunction == 0x04 ||
+         baseFunction == 0x06 || baseFunction == 0x10;
+}
+
+bool crcIsValid(size_t frameLength) {
+  if (frameLength < 4 || frameLength > candidateLength) {
+    return false;
+  }
+
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < frameLength - 2; ++i) {
+    crc ^= candidateBuffer[i];
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      if (crc & 0x0001) {
+        crc = (crc >> 1) ^ 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+
+  const uint16_t receivedCrc =
+      static_cast<uint16_t>(candidateBuffer[frameLength - 2]) |
+      (static_cast<uint16_t>(candidateBuffer[frameLength - 1]) << 8);
+  return crc == receivedCrc;
+}
+
+void discardCandidate() {
+  candidateLength = 0;
+}
+
+void sendCandidate() {
+  Serial.println();
+
+  udp.beginPacket(remote_ip, UDP_DESTINATION_PORT);
+  udp.write(candidateBuffer, candidateLength);
+  udp.endPacket();
+
+  discardCandidate();
+}
+
+bool tryCandidateLength(size_t frameLength) {
+  if (frameLength > MAX_MODBUS_FRAME_SIZE || candidateLength < frameLength) {
+    return false;
+  }
+
+  if (!crcIsValid(frameLength)) {
+    return false;
+  }
+
+  // A valid candidate must consume the complete receive buffer. This prevents
+  // accepting a shorter valid prefix and treating the remaining bytes as lost.
+  if (frameLength != candidateLength) {
+    return false;
+  }
+
+  sendCandidate();
+  return true;
+}
+
+bool tryCompleteCandidate() {
+  if (candidateLength < 2 || !isSupportedFunction(candidateBuffer[1])) {
+    return false;
+  }
+
+  const uint8_t functionCode = candidateBuffer[1];
+  const uint8_t baseFunction = functionCode & 0x7F;
+
+  // Exception responses contain address, exception function, exception code,
+  // and CRC. They are valid responses for the supported base functions.
+  if ((functionCode & 0x80) != 0) {
+    return tryCandidateLength(5);
+  }
+
+  if (baseFunction == 0x03 || baseFunction == 0x04) {
+    // A read response's byte count disambiguates it from an 8-byte request.
+    // Do not emit the request candidate at byte 8, because that could be the
+    // valid prefix of a longer response. The gap finalizer handles requests.
+    if (candidateLength >= 3) {
+      const uint8_t byteCount = candidateBuffer[2];
+      if (byteCount != 0 && (byteCount % 2) == 0) {
+        const size_t responseLength = static_cast<size_t>(5) + byteCount;
+        if (responseLength <= candidateLength) {
+          return tryCandidateLength(responseLength);
+        }
+        return false;
+      }
+    }
+    return false;
+  }
+
+  if (baseFunction == 0x06) {
+    // Read/write single register request and response are both fixed length.
+    return tryCandidateLength(8);
+  }
+
+  // Function 0x10 request and response lengths overlap at eight bytes. Prefer
+  // a structurally complete variable request when its length is available.
+  if (candidateLength >= 7) {
+    const uint16_t quantity =
+        (static_cast<uint16_t>(candidateBuffer[4]) << 8) |
+        candidateBuffer[5];
+    const uint8_t byteCount = candidateBuffer[6];
+    if (quantity >= 1 && quantity <= 123 && byteCount != 0 &&
+        byteCount == quantity * 2) {
+      return tryCandidateLength(static_cast<size_t>(9) + byteCount);
+    }
+  }
+
+  // Function 0x10 response: address, function, start address, quantity, CRC.
+  return tryCandidateLength(8);
+}
+
+bool tryGapCandidate() {
+  if (candidateLength != 8 || candidateLength < 2 ||
+      !isSupportedFunction(candidateBuffer[1])) {
+    return false;
+  }
+
+  const uint8_t baseFunction = candidateBuffer[1] & 0x7F;
+  if (baseFunction == 0x03 || baseFunction == 0x04 ||
+      baseFunction == 0x10) {
+    return tryCandidateLength(8);
+  }
+  return false;
+}
+
+void receiveModbusByte(uint8_t value) {
+  const uint32_t now = micros();
+
+  // A gap ends an ambiguous eight-byte request candidate. Longer or invalid
+  // candidates are discarded before the new byte starts the next frame.
+  if (candidateLength > 0 &&
+      static_cast<uint32_t>(now - lastByteMicros) >= MODBUS_T3_5_MICROS) {
+    if (!tryGapCandidate()) {
+      discardCandidate();
+    }
+  }
+
+  if (candidateLength >= MAX_MODBUS_FRAME_SIZE) {
+    discardCandidate();
+  }
+
+  candidateBuffer[candidateLength++] = value;
+  lastByteMicros = now;
+  p(value);
+  tryCompleteCandidate();
+}
+
 void loop() {
-  // handle mDNS and OTA
+  // Handle mDNS and OTA.
   ArduinoOTA.handle();
 
-  if (myPort.available() > 0) {
-    received = myPort.read();
-    RecvBuffer[recvIndex++] = received;
-    p(received);
-    lastModbusEvent = millis();
-    fReadData = true;
+  // Drain the software serial buffer. Candidate lengths and CRC determine
+  // normal frame completion; the RTU gap is retained for recovery only.
+  while (myPort.available() > 0) {
+    const int received = myPort.read();
+    if (received >= 0) {
+      receiveModbusByte(static_cast<uint8_t>(received));
+    }
   }
 
-  // check if we need to send the data
-  if (millis() - lastModbusEvent > INTERMESSAGE_GAP && fReadData) {
-    Serial.println();
-    lastModbusEvent = millis();
-    fReadData = false;
-
-    // send the data via UDP
-    udp.beginPacket(remote_ip, 8888);
-    udp.write(RecvBuffer, recvIndex);
-    udp.endPacket();
-
-    // reset index for next message
-    recvIndex = 0;
+  // Finalize a lone eight-byte request after the RTU inter-frame gap.
+  if (candidateLength > 0 &&
+      static_cast<uint32_t>(micros() - lastByteMicros) >= MODBUS_T3_5_MICROS) {
+    if (!tryGapCandidate()) {
+      discardCandidate();
+    }
   }
-
-/*
-  if (myPort.available() > 0) {
-    received = myPort.read();
-    //RecvBuffer[recvIndex++] = received;
-
-    //if (recvIndex>32) {
-    //  dumpData = true;
-    //}
-  }
-*/
-/*
-  // If the timer expired and positioned this var, we should now dump the received message
-  // into a UDP packet to the remote host/logger.
-  if (dumpData) {
-    receiveTime = micros() - MESSAGE_GAP_TIMEOUT_IN_MICROS;
-    
-    // reinitialize vars for next detection/dump
-    dumpData = false;
-
-    msgIndex++ ;
-    if (msgIndex > 999) msgIndex = 0;
-    
-    // build and send UDP message
-    udp.beginPacket(remote_ip, 8888);
-    
-    sprintf(receiveTimeString, "%015lu:", receiveTime);
-    udp.write(receiveTimeString, strlen(receiveTimeString));
-
-    sprintf(msgIndexString, "%04lu:", msgIndex);
-    udp.write(msgIndexString, strlen(msgIndexString));
-    
-    udp.write(RecvBuffer, recvIndex);
-
-    udp.endPacket();
-
-    // reset index for next message
-    recvIndex = 0;
-  }
-*/
 }
 
