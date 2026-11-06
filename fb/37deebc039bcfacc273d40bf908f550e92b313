@@ -1,0 +1,20 @@
+.vscode/extensions.json
+  h_8a649884fdc4d4 1-10
+compile_commands.json
+  h_8a649884fdc4d4 1-716
+platformio.ini
+  h_8a649884fdc4d4 21-24
+src/main.cpp
+  h_8a649884fdc4d4 27-32,34-36,38-40,130,139-166,168-184,187-189,191-199,201-203,206-207,209-308
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fb37deebc039bcfacc273d40bf908f550e92b313",
+  "prompts": {},
+  "humans": {
+    "h_8a649884fdc4d4": {
+      "author": "trizmark <zoltan.markella@gmail.com>"
+    }
+  }
+}
