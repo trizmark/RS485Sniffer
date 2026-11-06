@@ -1,0 +1,14 @@
+.gitignore
+  h_8a649884fdc4d4 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "abaf9b3d7d4d3a6b63ecff2097b2f65f91c40730",
+  "prompts": {},
+  "humans": {
+    "h_8a649884fdc4d4": {
+      "author": "trizmark <zoltan.markella@gmail.com>"
+    }
+  }
+}
