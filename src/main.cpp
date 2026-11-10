@@ -1,3 +1,4 @@
+//#include "ESPAsyncTCP.h"
 #include <Arduino.h>
 
 // work around SPIFFS deprecation
@@ -6,17 +7,15 @@
 #define SPIFFS LittleFS
 #include <LittleFS.h> 
 
-#include <ESP8266WiFi.h>
-#include <ESP8266mDNS.h>    // included with ESP8266 board def install
+//#include <ESP8266WiFi.h>
+//#include <ESP8266mDNS.h>    // included with ESP8266 board def install
+#include <ESPmDNS.h>
 #include <WiFiUdp.h>
 
 #include <ESPAsyncWiFiManager.h>
 
 #include <ArduinoOTA.h>
-String hostName = "rs485sniffer";
-
-#include "SoftwareSerial.h"
-
+String hostName = "rs485sniffer-2";
 
 // network related objects
 WiFiUDP udp;
@@ -33,7 +32,7 @@ constexpr uint32_t MODBUS_T3_5_MICROS =
 
 // Increase this value if the maximum frame size changes.
 constexpr size_t MAX_MODBUS_FRAME_SIZE = 64;
-constexpr uint16_t UDP_DESTINATION_PORT = 8888;
+constexpr uint16_t UDP_DESTINATION_PORT = 9999;
 
 uint8_t candidateBuffer[MAX_MODBUS_FRAME_SIZE];
 size_t candidateLength = 0;
@@ -41,12 +40,13 @@ uint32_t lastByteMicros = 0;
 
 IPAddress remote_ip(192, 168, 0, 201);
 
-#define RX_PIN D5
-#define TX_PIN D6
+//#define RX_PIN D5
+//#define TX_PIN D6
+#define RX_PIN 16
+#define TX_PIN 17
 
-EspSoftwareSerial::UART myPort;
-
-
+//EspSoftwareSerial::UART Serial2;
+//HardwareSerial Serial2(2);
 
 /*
  *  Initialise OTA
@@ -94,7 +94,8 @@ void init_OTA() {
 
     // start OTA receiver with mDNS
     ArduinoOTA.setHostname(hostName.c_str());
-    ArduinoOTA.begin(true);
+    //ArduinoOTA.begin(true);
+    ArduinoOTA.begin();
 
     Serial.println("[OTA  ] OTA setup complete");
 }
@@ -107,6 +108,7 @@ void init_WiFi() {
     WiFi.persistent(true); 
     AsyncWiFiManager wifiManager(&server, &dns);;
     wifiManager.autoConnect("RS485Sniffer_AutoConfig");
+    Serial.println("[WiFi ] WiFi setup complete");
 }
 
 /*
@@ -116,18 +118,25 @@ void init_mDNS() {
     // mDNS already set up by ArduinoOTA
     // all we need to do is advertise the HTTP server
     MDNS.addService("http", "tcp", 80);
+    Serial.println("[MDNS ] mDNS setup complete");
 }
 
 void setup() {
+  // init the serial port
+  Serial.begin(115200);
+
+  Serial.println("[SETUP] Setup starting");
+
   // init various items
   init_WiFi();
   init_OTA();
   init_mDNS();
 
-  // init the serial port
-  Serial.begin(115200);
+  //Serial2.begin(MODBUS_BAUD_RATE, SWSERIAL_8N1, RX_PIN, TX_PIN, false);
+  //Serial2.begin(MODBUS_BAUD_RATE, SERIAL_8N1, 16, 17, false);
+  Serial2.begin(MODBUS_BAUD_RATE, SERIAL_8N1, RX_PIN, TX_PIN);
 
-  myPort.begin(MODBUS_BAUD_RATE, SWSERIAL_8N1, RX_PIN, TX_PIN, false);
+  Serial.println("[SETUP] Setup complete");
 }
 
 
@@ -214,19 +223,23 @@ bool tryCompleteCandidate() {
 
   if (baseFunction == 0x03 || baseFunction == 0x04) {
     // A read response's byte count disambiguates it from an 8-byte request.
-    // Do not emit the request candidate at byte 8, because that could be the
-    // valid prefix of a longer response. The gap finalizer handles requests.
+    // Check the response candidate first when it is complete, then check the
+    // fixed request candidate. This also works when several frames are
+    // already buffered by the serial driver and their physical gaps are no
+    // longer observable by the application.
     if (candidateLength >= 3) {
       const uint8_t byteCount = candidateBuffer[2];
       if (byteCount != 0 && (byteCount % 2) == 0) {
         const size_t responseLength = static_cast<size_t>(5) + byteCount;
-        if (responseLength <= candidateLength) {
-          return tryCandidateLength(responseLength);
+        if (responseLength <= candidateLength &&
+            tryCandidateLength(responseLength)) {
+          return true;
         }
-        return false;
       }
     }
-    return false;
+
+    // Request: address, function, start address, quantity, CRC.
+    return tryCandidateLength(8);
   }
 
   if (baseFunction == 0x06) {
@@ -293,8 +306,8 @@ void loop() {
 
   // Drain the software serial buffer. Candidate lengths and CRC determine
   // normal frame completion; the RTU gap is retained for recovery only.
-  while (myPort.available() > 0) {
-    const int received = myPort.read();
+  while (Serial2.available() > 0) {
+    const int received = Serial2.read();
     if (received >= 0) {
       receiveModbusByte(static_cast<uint8_t>(received));
     }
@@ -308,4 +321,3 @@ void loop() {
     }
   }
 }
-
